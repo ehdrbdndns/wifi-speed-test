@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>와이파이 속도 측정</title>
+<style>
+  :root {
+    --bg: #f5f6f8; --card: #ffffff; --text: #16181d; --muted: #6b7280;
+    --line: #e5e7eb; --accent: #2563eb; --accent-text: #ffffff; --error: #b91c1c;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1115; --card: #181b22; --text: #f3f4f6; --muted: #9ca3af;
+      --line: #2a2f3a; --accent: #60a5fa; --accent-text: #0f1115; --error: #fca5a5;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Malgun Gothic", "Noto Sans KR", sans-serif;
+    display: flex; align-items: center; justify-content: center; padding: 24px 16px;
+  }
+  main { width: 100%; max-width: 440px; }
+  h1 { font-size: 20px; margin: 0 0 16px; text-align: center; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 16px; padding: 24px; }
+  .live { text-align: center; padding: 8px 0 20px; }
+  .live .label { color: var(--muted); font-size: 14px; min-height: 20px; }
+  .live .value { font-size: 64px; font-weight: 700; line-height: 1.1; font-variant-numeric: tabular-nums; }
+  .live .unit { color: var(--muted); font-size: 16px; }
+  .bar { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; margin-bottom: 20px; }
+  .bar > div { height: 100%; width: 0; background: var(--accent); transition: width .2s linear; }
+  .results { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 20px; }
+  .results div { border: 1px solid var(--line); border-radius: 12px; padding: 12px; }
+  .results dt { color: var(--muted); font-size: 13px; margin-bottom: 4px; }
+  .results dd { margin: 0; font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .results dd small { font-size: 13px; font-weight: 400; color: var(--muted); }
+  button {
+    width: 100%; padding: 14px; font-size: 17px; font-weight: 600; border: 0; border-radius: 12px;
+    background: var(--accent); color: var(--accent-text); cursor: pointer; font-family: inherit;
+  }
+  button:disabled { opacity: .5; cursor: default; }
+  .error { color: var(--error); font-size: 14px; margin: 12px 0 0; text-align: center; }
+  .note { color: var(--muted); font-size: 13px; line-height: 1.6; margin: 16px 4px 0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>와이파이 속도 측정</h1>
+  <div class="card">
+    <div class="live">
+      <div class="label" id="phase">버튼을 누르면 측정을 시작합니다</div>
+      <div class="value" id="live">–</div>
+      <div class="unit" id="unit">Mbps</div>
+    </div>
+    <div class="bar"><div id="progress"></div></div>
+    <dl class="results">
+      <div><dt>다운로드</dt><dd><span id="down">–</span> <small>Mbps</small></dd></div>
+      <div><dt>업로드</dt><dd><span id="up">–</span> <small>Mbps</small></dd></div>
+      <div><dt>지연 시간(핑)</dt><dd><span id="ping">–</span> <small>ms</small></dd></div>
+      <div><dt>지연 변동(지터)</dt><dd><span id="jitter">–</span> <small>ms</small></dd></div>
+    </dl>
+    <button id="start">측정 시작</button>
+    <p class="error" id="error" hidden></p>
+  </div>
+  <p class="note">
+    이 기기에서 인터넷까지의 전체 속도(와이파이 + 인터넷 회선)를 잽니다.
+    측정에는 약 20초가 걸리고 데이터를 수백 MB까지 쓸 수 있으니, 모바일 데이터가 아닌 와이파이에 연결한 상태에서 쓰세요.
+    측정 서버는 Cloudflare이고, 지연 시간은 HTTP 요청 왕복 시간이라 일반 핑보다 조금 크게 나옵니다.
+  </p>
+</main>
+<script>
+const BASE = 'https://speed.cloudflare.com';
+const DOWN_MS = 8000, UP_MS = 8000, WARMUP_MS = 1500, STREAMS = 4;
+const DOWN_BYTES = 25_000_000, UP_BYTES = 10_000_000, PING_COUNT = 12;
+
+const $ = id => document.getElementById(id);
+const fmt = mbps => mbps >= 100 ? mbps.toFixed(0) : mbps >= 10 ? mbps.toFixed(1) : mbps.toFixed(2);
+const setLive = (phase, value, unit) => { $('phase').textContent = phase; $('live').textContent = value; $('unit').textContent = unit; };
+const setProgress = fraction => { $('progress').style.width = Math.min(100, fraction * 100) + '%'; };
+
+async function measurePing() {
+  const samples = [];
+  for (let i = 0; i < PING_COUNT; i++) {
+    const t0 = performance.now();
+    const res = await fetch(`${BASE}/__down?bytes=0&r=${Math.random()}`, { cache: 'no-store' });
+    await res.arrayBuffer();
+    const ms = performance.now() - t0;
+    if (i > 0) {                // 첫 요청은 연결 수립 시간이 섞이므로 버린다
+      samples.push(ms);
+      setLive('지연 시간 측정 중', ms.toFixed(0), 'ms');
+    }
+    setProgress((i + 1) / PING_COUNT * 0.1);
+  }
+  const sorted = [...samples].sort((a, b) => a - b);
+  const median = sorted[Math.floor(sorted.length / 2)];
+  let jitter = 0;
+  for (let i = 1; i < samples.length; i++) jitter += Math.abs(samples[i] - samples[i - 1]);
+  return { ping: median, jitter: jitter / (samples.length - 1) };
+}
+
+// 여러 연결로 동시에 전송하면서 워밍업 구간 이후의 바이트 수로 속도를 계산한다.
+function runTimed(durationMs, phase, progressFrom, startStream) {
+  return new Promise((resolve, reject) => {
+    const start = performance.now();
+    let total = 0, counted = 0, countStart = null, failed = 0, done = false;
+    const onBytes = n => {
+      total += n;
+      if (countStart !== null) counted += n;
+    };
+    const stoppers = [];
+    const finish = () => {
+      if (done) return;
+      done = true;
+      clearInterval(timer);
+      stoppers.forEach(stop => stop());
+      const seconds = (performance.now() - countStart) / 1000;
+      if (countStart === null || counted === 0) reject(new Error('측정 서버와 데이터를 주고받지 못했습니다.'));
+      else resolve(counted * 8 / seconds / 1e6);
+    };
+    const onFail = () => { if (++failed >= STREAMS) finish(); };
+    const timer = setInterval(() => {
+      const elapsed = performance.now() - start;
+      if (countStart === null && elapsed >= WARMUP_MS && total > 0) countStart = performance.now();
+      if (countStart !== null) {
+        const seconds = (performance.now() - countStart) / 1000;
+        if (seconds > 0.3) setLive(phase, fmt(counted * 8 / seconds / 1e6), 'Mbps');
+      }
+      setProgress(progressFrom + elapsed / durationMs * 0.45);
+      if (elapsed >= durationMs) finish();
+    }, 100);
+    setLive(phase, '…', 'Mbps');
+    for (let i = 0; i < STREAMS; i++) stoppers.push(startStream(onBytes, onFail, () => done));
+  });
+}
+
+function downloadStream(onBytes, onFail, isDone) {
+  const controller = new AbortController();
+  (async () => {
+    try {
+      while (!isDone()) {
+        const res = await fetch(`${BASE}/__down?bytes=${DOWN_BYTES}&r=${Math.random()}`, { cache: 'no-store', signal: controller.signal });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const reader = res.body.getReader();
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          onBytes(value.byteLength);
+        }
+      }
+    } catch (e) {
+      if (!isDone()) onFail();
+    }
+  })();
+  return () => controller.abort();
+}
+
+let uploadBlob = null;
+function makeUploadBlob() {
+  const chunk = new Uint8Array(65536);
+  crypto.getRandomValues(chunk);   // 압축되지 않는 데이터
+  const parts = [];
+  for (let n = 0; n < UP_BYTES; n += chunk.length) parts.push(chunk);
+  return new Blob(parts, { type: 'text/plain' });
+}
+
+function uploadStream(onBytes, onFail, isDone) {
+  let xhr = null, stopped = false;
+  const send = () => {
+    if (stopped || isDone()) return;
+    let last = 0;
+    xhr = new XMLHttpRequest();
+    xhr.open('POST', `${BASE}/__up?r=${Math.random()}`);
+    xhr.upload.onprogress = e => { onBytes(e.loaded - last); last = e.loaded; };
+    xhr.onload = () => (xhr.status >= 200 && xhr.status < 300) ? send() : (isDone() || onFail());
+    xhr.onerror = () => { if (!stopped && !isDone()) onFail(); };
+    xhr.send(uploadBlob);
+  };
+  send();
+  return () => { stopped = true; if (xhr) xhr.abort(); };
+}
+
+async function run() {
+  const button = $('start');
+  button.disabled = true;
+  $('error').hidden = true;
+  for (const id of ['down', 'up', 'ping', 'jitter']) $(id).textContent = '–';
+  setProgress(0);
+  try {
+    const { ping, jitter } = await measurePing();
+    $('ping').textContent = ping.toFixed(0);
+    $('jitter').textContent = jitter.toFixed(1);
+
+    const down = await runTimed(DOWN_MS, '다운로드 측정 중', 0.1, downloadStream);
+    $('down').textContent = fmt(down);
+
+    uploadBlob = uploadBlob || makeUploadBlob();
+    const up = await runTimed(UP_MS, '업로드 측정 중', 0.55, uploadStream);
+    $('up').textContent = fmt(up);
+
+    setProgress(1);
+    setLive('측정 완료 · 다운로드', fmt(down), 'Mbps');
+  } catch (e) {
+    setLive('측정 실패', '–', 'Mbps');
+    $('error').textContent = (e && e.message && !/fetch|network/i.test(e.message) ? e.message + ' ' : '측정 서버에 연결하지 못했습니다. ') + '인터넷 연결을 확인하고 다시 시도하세요.';
+    $('error').hidden = false;
+  } finally {
+    button.disabled = false;
+    button.textContent = '다시 측정';
+  }
+}
+$('start').addEventListener('click', run);
+</script>
+</body>
+</html>
